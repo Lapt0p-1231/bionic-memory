@@ -1,0 +1,19 @@
+# 复制为 config.yaml 后按需修改
+embedding:
+  model: "BAAI/bge-small-zh-v1.5"
+  device: "cpu"          # 有 GPU 可改 "cuda"
+  cache_dir: null        # 模型缓存目录，null 用默认位置
+
+memory:
+  short_term_limit: 30   # 短期记忆保留轮数（始终完整进上下文）
+  recall_top_k: 3        # RAG 召回条数
+  recall_threshold: 0.55 # 相似度阈值，低于此值不召回
+
+musing:
+  enabled: true
+  interval_minutes: 120  # 走神间隔
+  min_importance: 0.6    # 只回忆重要度高于此值的记忆
+  max_per_round: 3
+
+storage:
+  data_dir: "./bionic_memory_data"  # SQLite + ChromaDB 存放目录

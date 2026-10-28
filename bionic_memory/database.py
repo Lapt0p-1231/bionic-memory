@@ -1,0 +1,215 @@
+"""存储层：SQLite 负责热记忆与人设状态，ChromaDB 负责冷记忆向量检索。"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import threading
+import time
+
+from .models import Emotion, Memory
+
+
+class Storage:
+    def __init__(self, data_dir: str):
+        os.makedirs(data_dir, exist_ok=True)
+        self.data_dir = data_dir
+        self._lock = threading.Lock()
+
+        self._conn = sqlite3.connect(
+            os.path.join(data_dir, "memory.db"), check_same_thread=False
+        )
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._init_tables()
+
+        import chromadb
+
+        self._client = chromadb.PersistentClient(path=os.path.join(data_dir, "chroma"))
+        self._collection = self._client.get_or_create_collection(
+            "memories", metadata={"hnsw:space": "cosine"}
+        )
+
+    def _init_tables(self) -> None:
+        with self._lock, self._conn:
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS memories (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    valence REAL DEFAULT 0,
+                    arousal REAL DEFAULT 0,
+                    importance REAL DEFAULT 0.5,
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_memories_user
+                    ON memories (user_id, importance DESC);
+                CREATE TABLE IF NOT EXISTS short_term (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_short_user
+                    ON short_term (user_id, id);
+                CREATE TABLE IF NOT EXISTS profile (
+                    user_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL
+                );
+                """
+            )
+
+    # ---------- 热记忆 ----------
+    def append_turn(self, user_id: str, role: str, content: str,
+                    keep_turns: int = 30) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO short_term (user_id, role, content, created_at) VALUES (?,?,?,?)",
+                (user_id, role, content, time.time()),
+            )
+            self._conn.execute(
+                """
+                DELETE FROM short_term
+                WHERE user_id = ? AND id NOT IN (
+                    SELECT id FROM short_term WHERE user_id = ?
+                    ORDER BY id DESC LIMIT ?
+                )
+                """,
+                (user_id, user_id, keep_turns * 2),
+            )
+
+    def get_short_term(self, user_id: str, keep_turns: int = 30) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT role, content FROM short_term WHERE user_id = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (user_id, keep_turns * 2),
+            ).fetchall()
+        return [{"role": r, "content": c} for r, c in reversed(rows)]
+
+    # ---------- 冷记忆 ----------
+    def add_memory(self, user_id: str, content: str, embedding: list[float],
+                   memory_type: str = "dialogue",
+                   emotion: Emotion | None = None) -> Memory:
+        emotion = (emotion or Emotion()).clamped()
+        memory = Memory(user_id=user_id, content=content, type=memory_type,
+                        emotion=emotion)
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO memories (id, user_id, content, type, valence, arousal,"
+                " importance, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (memory.id, user_id, content, memory_type, emotion.valence,
+                 emotion.arousal, emotion.importance, memory.created_at),
+            )
+        self._collection.add(
+            ids=[memory.id],
+            embeddings=[embedding],
+            documents=[content],
+            metadatas=[{
+                "user_id": user_id,
+                "type": memory_type,
+                "valence": emotion.valence,
+                "arousal": emotion.arousal,
+                "importance": emotion.importance,
+                "created_at": memory.created_at,
+            }],
+        )
+        return memory
+
+    def recall(self, user_id: str, embedding: list[float], top_k: int = 3,
+               threshold: float = 0.55) -> list[tuple[Memory, float]]:
+        total = self._collection.count()
+        if total == 0:
+            return []
+        result = self._collection.query(
+            query_embeddings=[embedding],
+            n_results=max(top_k * 2, top_k),
+            where={"user_id": user_id},
+            include=["documents", "metadatas", "distances"],
+        )
+        ids = result.get("ids") or [[]]
+        docs = result.get("documents") or [[]]
+        metas = result.get("metadatas") or [[]]
+        dists = result.get("distances") or [[]]
+
+        hits: list[tuple[Memory, float]] = []
+        for mid, doc, meta, dist in zip(ids[0], docs[0], metas[0], dists[0]):
+            score = 1.0 - float(dist)
+            if score < threshold:
+                continue
+            meta = meta or {}
+            hits.append((
+                Memory(
+                    id=mid,
+                    user_id=user_id,
+                    content=doc,
+                    type=meta.get("type", "dialogue"),
+                    emotion=Emotion(
+                        valence=float(meta.get("valence", 0)),
+                        arousal=float(meta.get("arousal", 0)),
+                        importance=float(meta.get("importance", 0.5)),
+                    ),
+                    created_at=float(meta.get("created_at", 0)),
+                ),
+                score,
+            ))
+            if len(hits) >= top_k:
+                break
+        return hits
+
+    def get_important(self, user_id: str, limit: int = 3,
+                      min_importance: float = 0.6) -> list[Memory]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, content, type, valence, arousal, importance, created_at "
+                "FROM memories WHERE user_id = ? AND importance >= ? "
+                "ORDER BY importance DESC, created_at DESC LIMIT ?",
+                (user_id, min_importance, limit),
+            ).fetchall()
+        return [
+            Memory(id=r[0], user_id=user_id, content=r[1], type=r[2],
+                   emotion=Emotion(valence=r[3], arousal=r[4], importance=r[5]),
+                   created_at=r[6])
+            for r in rows
+        ]
+
+    # ---------- 人设状态 ----------
+    def set_profile(self, user_id: str, state: dict) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO profile (user_id, state) VALUES (?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET state = excluded.state",
+                (user_id, json.dumps(state, ensure_ascii=False)),
+            )
+
+    def get_profile(self, user_id: str) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT state FROM profile WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        if not row:
+            return {}
+        try:
+            return json.loads(row[0])
+        except json.JSONDecodeError:
+            return {}
+
+    # ---------- 清理 ----------
+    def clear_user(self, user_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM short_term WHERE user_id = ?", (user_id,))
+            self._conn.execute("DELETE FROM profile WHERE user_id = ?", (user_id,))
+            rows = self._conn.execute(
+                "SELECT id FROM memories WHERE user_id = ?", (user_id,)
+            ).fetchall()
+            self._conn.execute("DELETE FROM memories WHERE user_id = ?", (user_id,))
+        ids = [r[0] for r in rows]
+        if ids:
+            self._collection.delete(ids=ids)
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()

@@ -1,0 +1,8 @@
+# ---- 核心依赖 ----
+chromadb>=1.0
+fastembed>=0.4
+pydantic>=2.0
+PyYAML>=6.0
+
+# ---- 仅在运行 examples/ 下的 LLM 示例时需要 ----
+# openai>=1.40
