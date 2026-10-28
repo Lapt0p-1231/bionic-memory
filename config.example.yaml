@@ -3,6 +3,7 @@ embedding:
   model: "BAAI/bge-small-zh-v1.5"
   device: "cpu"          # 有 GPU 可改 "cuda"
   cache_dir: null        # 模型缓存目录，null 用默认位置
+  cache_size: 1024       # embedding 结果 LRU 缓存条数，0 关闭
 
 memory:
   short_term_limit: 30   # 短期记忆保留轮数（始终完整进上下文）
@@ -12,9 +13,15 @@ memory:
 
 musing:
   enabled: true
-  interval_minutes: 120  # 走神间隔
+  interval_minutes: 120  # 走神间隔，0 = 关闭；支持小数（如 0.5）
   min_importance: 0.6    # 只回忆重要度高于此值的记忆
   max_per_round: 3
+  timeout_seconds: 60    # 单次 LLM 调用超时
 
 storage:
   data_dir: "./bionic_memory_data"  # SQLite + ChromaDB 存放目录
+  hnsw:                  # 显式配置，兼顾召回率与写入性能
+    space: cosine
+    M: 32                # 每个节点的连接数
+    construction_ef: 200 # 建索引时的候选集大小
+    search_ef: 100       # 查询时的候选集大小

@@ -35,7 +35,7 @@ pip install -r requirements.txt
 
 ```python
 import asyncio
-from bionic_memory import BionicMemory
+from bionic_memory import BionicMemory, format_recall
 
 async def my_llm(prompt: str) -> str:
     # 你的模型调用，任意厂商，只要返回字符串
@@ -53,6 +53,9 @@ async def main():
     #                          "confidence": 1.0}],
     #   "emotion_state": {"valence": -0.3, "arousal": 0.2, "importance": 0.6}
     # }
+
+    # 召回片段可直接拼进提示词：走神记忆会自动带上"梦"的批注
+    recall_text = format_recall(context["recalled_memories"])
 
     # 2. 你自己调用模型生成回复
     reply = await my_llm("今天天气真差")
@@ -74,6 +77,7 @@ embedding:
   model: "BAAI/bge-small-zh-v1.5"
   device: "cpu"          # 有 GPU 可改 "cuda"
   cache_dir: null
+  cache_size: 1024       # embedding LRU 缓存，0 关闭
 
 memory:
   short_term_limit: 30   # 短期记忆保留轮数
@@ -83,12 +87,18 @@ memory:
 
 musing:
   enabled: true
-  interval_minutes: 120  # 走神间隔
+  interval_minutes: 120  # 走神间隔，0 = 关闭
   min_importance: 0.6
   max_per_round: 3
+  timeout_seconds: 60
 
 storage:
   data_dir: "./bionic_memory_data"
+  hnsw:
+    space: cosine
+    M: 32
+    construction_ef: 200
+    search_ef: 100
 ```
 
 也可以完全不写 YAML，直接传 dict：
@@ -132,6 +142,9 @@ async def my_llm(prompt: str) -> str: ...
 | `stop_musing_loop()` | 停止定时器 |
 | `clear()` | 清空该用户全部记忆 |
 | `await close()` | 关闭数据库与后台任务 |
+| `format_recall(recalled_memories)` | 把召回结果格式化成提示词片段（自动给梦加批注） |
+
+所有阻塞操作（SQLite / ChromaDB / 嵌入推理）都通过 `asyncio.to_thread` 执行，不会阻塞事件循环。
 
 ## 为什么走神不会变成胡编
 

@@ -11,7 +11,13 @@ from .models import Emotion, Memory
 
 
 class Storage:
-    def __init__(self, data_dir: str):
+    """SQLite + ChromaDB 的持久化封装。
+
+    热记忆（short_term / profile）在 SQLite，冷记忆（memories）在 ChromaDB。
+    本类所有方法都是同步的，异步调用方请用 asyncio.to_thread 包装。
+    """
+
+    def __init__(self, data_dir: str, hnsw: dict | None = None):
         os.makedirs(data_dir, exist_ok=True)
         self.data_dir = data_dir
         self._lock = threading.Lock()
@@ -26,8 +32,22 @@ class Storage:
         import chromadb
 
         self._client = chromadb.PersistentClient(path=os.path.join(data_dir, "chroma"))
+        # HNSW 参数显式配置：写入性能与召回率平衡
+        hnsw_cfg = {
+            "space": "cosine",
+            "M": 32,
+            "construction_ef": 200,
+            "search_ef": 100,
+        }
+        hnsw_cfg.update(hnsw or {})
+        metadata = {
+            "hnsw:space": str(hnsw_cfg["space"]),
+            "hnsw:M": int(hnsw_cfg["M"]),
+            "hnsw:construction_ef": int(hnsw_cfg["construction_ef"]),
+            "hnsw:search_ef": int(hnsw_cfg["search_ef"]),
+        }
         self._collection = self._client.get_or_create_collection(
-            "memories", metadata={"hnsw:space": "cosine"}
+            "memories", metadata=metadata
         )
 
     def _init_tables(self) -> None:
@@ -65,6 +85,7 @@ class Storage:
     # ---------- 热记忆 ----------
     def append_turn(self, user_id: str, role: str, content: str,
                     keep_turns: int = 30) -> None:
+        """追加一条短期记忆，并把超出 keep_turns 轮的旧记录裁掉。"""
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO short_term (user_id, role, content, created_at) VALUES (?,?,?,?)",
@@ -82,6 +103,7 @@ class Storage:
             )
 
     def get_short_term(self, user_id: str, keep_turns: int = 30) -> list[dict]:
+        """按时间正序返回最近 keep_turns 轮对话。"""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT role, content FROM short_term WHERE user_id = ? "
@@ -96,6 +118,10 @@ class Storage:
                    emotion: Emotion | None = None,
                    source_id: str | None = None,
                    confidence: float | None = None) -> Memory:
+        """写入一条冷记忆（SQLite 元数据 + ChromaDB 向量）。
+
+        走神产物（type="musing"）默认 confidence=0.4，其余默认 1.0。
+        """
         emotion = (emotion or Emotion()).clamped()
         if confidence is None:
             # 走神产物是"梦"，默认低置信度
@@ -131,6 +157,11 @@ class Storage:
     def recall(self, user_id: str, embedding: list[float], top_k: int = 3,
                threshold: float = 0.55,
                max_musing: int = 1) -> list[tuple[Memory, float]]:
+        """语义召回。
+
+        真实对话优先；走神产物（梦）最多返回 max_musing 条，
+        避免虚构内容挤掉真实记忆。
+        """
         total = self._collection.count()
         if total == 0:
             return []
@@ -177,6 +208,7 @@ class Storage:
 
     def get_important(self, user_id: str, limit: int = 3,
                       min_importance: float = 0.6) -> list[Memory]:
+        """取高重要度记忆作为走神素材（排除走神产物，避免梦生梦）。"""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, content, type, valence, arousal, importance, created_at "
@@ -194,6 +226,7 @@ class Storage:
 
     # ---------- 人设状态 ----------
     def set_profile(self, user_id: str, state: dict) -> None:
+        """覆盖写入用户情绪状态。"""
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO profile (user_id, state) VALUES (?, ?) "
@@ -202,6 +235,7 @@ class Storage:
             )
 
     def get_profile(self, user_id: str) -> dict:
+        """读取用户情绪状态，没有则返回空 dict。"""
         with self._lock:
             row = self._conn.execute(
                 "SELECT state FROM profile WHERE user_id = ?", (user_id,)
@@ -215,6 +249,7 @@ class Storage:
 
     # ---------- 清理 ----------
     def clear_user(self, user_id: str) -> None:
+        """删除该用户的全部热记忆、冷记忆与情绪状态。"""
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM short_term WHERE user_id = ?", (user_id,))
             self._conn.execute("DELETE FROM profile WHERE user_id = ?", (user_id,))
@@ -227,5 +262,6 @@ class Storage:
             self._collection.delete(ids=ids)
 
     def close(self) -> None:
+        """关闭 SQLite 连接。"""
         with self._lock:
             self._conn.close()
