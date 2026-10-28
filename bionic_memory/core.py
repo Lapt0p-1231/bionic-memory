@@ -33,6 +33,7 @@ DEFAULT_CONFIG: dict = {
         "short_term_limit": 30,
         "recall_top_k": 3,
         "recall_threshold": 0.55,
+        "max_musing_recall": 1,
     },
     "musing": {
         "enabled": True,
@@ -130,6 +131,7 @@ class BionicMemory:
                 embedding,
                 top_k=mem_cfg["recall_top_k"],
                 threshold=mem_cfg["recall_threshold"],
+                max_musing=mem_cfg.get("max_musing_recall", 1),
             )
             recalled = [
                 {
@@ -137,6 +139,7 @@ class BionicMemory:
                     "type": memory.type,
                     "score": round(score, 4),
                     "importance": memory.emotion.importance,
+                    "confidence": memory.confidence,
                 }
                 for memory, score in hits
             ]
@@ -203,6 +206,7 @@ class BionicMemory:
                 created.append(self.db.add_memory(
                     self.user_id, text, embedding, memory_type="musing",
                     emotion=Emotion(importance=0.6),
+                    source_id=memory.id, confidence=0.4,
                 ))
             except Exception as exc:
                 logger.warning("走神生成失败：%s", exc)

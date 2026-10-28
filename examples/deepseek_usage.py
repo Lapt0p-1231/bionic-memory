@@ -37,7 +37,12 @@ async def main() -> None:
     system_parts = ["你是一个温柔的朋友。"]
     if context["recalled_memories"]:
         system_parts.append("你突然想起这些往事：")
-        system_parts += [f"- {m['content']}" for m in context["recalled_memories"]]
+        for m in context["recalled_memories"]:
+            # 走神产物是梦，措辞上带点不确定，别当成事实
+            if m["type"] == "musing":
+                system_parts.append(f"- （好像做过一个类似的梦，画面很模糊）{m['content']}")
+            else:
+                system_parts.append(f"- {m['content']}")
     messages = [{"role": "system", "content": "\n".join(system_parts)}]
     messages += context["short_term"]
     messages.append({"role": "user", "content": user_message})

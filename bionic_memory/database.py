@@ -93,10 +93,17 @@ class Storage:
     # ---------- 冷记忆 ----------
     def add_memory(self, user_id: str, content: str, embedding: list[float],
                    memory_type: str = "dialogue",
-                   emotion: Emotion | None = None) -> Memory:
+                   emotion: Emotion | None = None,
+                   source_id: str | None = None,
+                   confidence: float | None = None) -> Memory:
         emotion = (emotion or Emotion()).clamped()
+        if confidence is None:
+            # 走神产物是"梦"，默认低置信度
+            confidence = 0.4 if memory_type == "musing" else 1.0
+        confidence = max(0.0, min(1.0, float(confidence)))
         memory = Memory(user_id=user_id, content=content, type=memory_type,
-                        emotion=emotion)
+                        emotion=emotion, source_id=source_id,
+                        confidence=confidence)
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO memories (id, user_id, content, type, valence, arousal,"
@@ -114,13 +121,16 @@ class Storage:
                 "valence": emotion.valence,
                 "arousal": emotion.arousal,
                 "importance": emotion.importance,
+                "source_id": str(source_id or ""),
+                "confidence": confidence,
                 "created_at": memory.created_at,
             }],
         )
         return memory
 
     def recall(self, user_id: str, embedding: list[float], top_k: int = 3,
-               threshold: float = 0.55) -> list[tuple[Memory, float]]:
+               threshold: float = 0.55,
+               max_musing: int = 1) -> list[tuple[Memory, float]]:
         total = self._collection.count()
         if total == 0:
             return []
@@ -135,30 +145,35 @@ class Storage:
         metas = result.get("metadatas") or [[]]
         dists = result.get("distances") or [[]]
 
-        hits: list[tuple[Memory, float]] = []
+        dialogues: list[tuple[Memory, float]] = []
+        musings: list[tuple[Memory, float]] = []
         for mid, doc, meta, dist in zip(ids[0], docs[0], metas[0], dists[0]):
             score = 1.0 - float(dist)
             if score < threshold:
                 continue
             meta = meta or {}
-            hits.append((
-                Memory(
-                    id=mid,
-                    user_id=user_id,
-                    content=doc,
-                    type=meta.get("type", "dialogue"),
-                    emotion=Emotion(
-                        valence=float(meta.get("valence", 0)),
-                        arousal=float(meta.get("arousal", 0)),
-                        importance=float(meta.get("importance", 0.5)),
-                    ),
-                    created_at=float(meta.get("created_at", 0)),
+            memory = Memory(
+                id=mid,
+                user_id=user_id,
+                content=doc,
+                type=meta.get("type", "dialogue"),
+                emotion=Emotion(
+                    valence=float(meta.get("valence", 0)),
+                    arousal=float(meta.get("arousal", 0)),
+                    importance=float(meta.get("importance", 0.5)),
                 ),
-                score,
-            ))
-            if len(hits) >= top_k:
-                break
-        return hits
+                source_id=meta.get("source_id") or None,
+                confidence=float(meta.get("confidence", 1.0)),
+                created_at=float(meta.get("created_at", 0)),
+            )
+            # 真实对话优先：走神产物最多召回 max_musing 条，梦境不能挤掉事实
+            if memory.type == "musing":
+                musings.append((memory, score))
+            else:
+                dialogues.append((memory, score))
+
+        picks = (dialogues + musings[:max(0, max_musing)])[:top_k]
+        return picks
 
     def get_important(self, user_id: str, limit: int = 3,
                       min_importance: float = 0.6) -> list[Memory]:
@@ -166,6 +181,7 @@ class Storage:
             rows = self._conn.execute(
                 "SELECT id, content, type, valence, arousal, importance, created_at "
                 "FROM memories WHERE user_id = ? AND importance >= ? "
+                "AND type != 'musing' "
                 "ORDER BY importance DESC, created_at DESC LIMIT ?",
                 (user_id, min_importance, limit),
             ).fetchall()

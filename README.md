@@ -21,6 +21,7 @@
 - 可配置：召回条数、相似度阈值、短期记忆长度、走神间隔
 - 中文友好：默认嵌入模型为 `BAAI/bge-small-zh-v1.5`
 - 解耦：不依赖 LangChain / LlamaIndex，依赖只有 4 个
+- 梦境防幻觉：走神产物带低置信度与来源标记，召回限流，只以"模糊的梦"出现
 
 ## 安装
 
@@ -48,7 +49,8 @@ async def main():
     # context == {
     #   "short_term": [{"role": "user", "content": "..."}, ...],
     #   "recalled_memories": [{"content": "...", "type": "dialogue",
-    #                          "score": 0.72, "importance": 0.8}],
+    #                          "score": 0.72, "importance": 0.8,
+    #                          "confidence": 1.0}],
     #   "emotion_state": {"valence": -0.3, "arousal": 0.2, "importance": 0.6}
     # }
 
@@ -77,6 +79,7 @@ memory:
   short_term_limit: 30   # 短期记忆保留轮数
   recall_top_k: 3        # RAG 召回条数
   recall_threshold: 0.55 # 相似度阈值（低于此值不召回）
+  max_musing_recall: 1   # 召回里最多带几条走神记忆
 
 musing:
   enabled: true
@@ -129,6 +132,19 @@ async def my_llm(prompt: str) -> str: ...
 | `stop_musing_loop()` | 停止定时器 |
 | `clear()` | 清空该用户全部记忆 |
 | `await close()` | 关闭数据库与后台任务 |
+
+## 为什么走神不会变成胡编
+
+走神是最容易产生幻觉的地方：模型可能把"感受"编造成"事件"，然后在下一次聊天里当成事实说出来。本库用四层设计把它按住：
+
+1. **来源可追溯**：每条走神记忆带 `source_id`，指向它派生自哪条真实对话
+2. **低置信度**：走神产物 `confidence=0.4`，真实对话为 `1.0`
+3. **召回限流**：Top-K 里最多带 `max_musing_recall` 条走神记忆，且真实对话优先
+4. **措辞梦化**：注入时以"好像做过一个类似的梦，画面很模糊"出现，天然带不确定性
+
+同时走神素材会排除 `type="musing"` 的记录，避免"梦生梦"越走越偏。提示词也禁止编造具体事件、时间、地点、人名或承诺。
+
+效果是：角色会像人一样记混、做梦、说"我好像梦到过"，但不会把虚构当成确定的事实。是否保留这点"不精确"，由你在拼接提示词时决定——库只负责把 `type` 和 `confidence` 交给你。
 
 ## 工作原理
 
